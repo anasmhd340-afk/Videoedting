@@ -18,9 +18,11 @@ jobs:
           DRIVE_LINK = "https://drive.google.com/drive/folders/1tUd2HNXpDTPRekMlnOiYqDbcpi6Th-fx"
           os.makedirs("raw", exist_ok=True)
           os.makedirs("work", exist_ok=True)
-          os.system(f'gdown --folder "{DRIVE_LINK}" -O raw --remaining-ok')
+          os.system(f'gdown --folder "{DRIVE_LINK}" -O raw --continue')
           clips = sorted([c for c in glob.glob("raw/**/*.*", recursive=True) if c.lower().endswith(('.mp4', '.mov', '.mkv')) and "Final_" not in c])
           bgm = glob.glob("raw/**/bgm.mp3", recursive=True)
+          if not clips:
+              raise FileNotFoundError("No videos downloaded! Check Drive folder link and permissions.")
           def get_info(p):
               out = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', p]).decode().strip().splitlines()
               return int(out[0]), int(out[1]), float(out[2])
