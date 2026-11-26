@@ -41,32 +41,18 @@ jobs:
           if not clips:
               raise FileNotFoundError("No videos downloaded! Check Drive folder link and permissions.")
 
-          # .cube LUT ഫോൾഡറിൽ ഇല്ലെങ്കിൽ മൂന്നാറിന് ചേർന്ന Cinematic LUT നിർമ്മിക്കുന്നു
-          if lut_files:
-              lut_path = lut_files[0]
-              print(f"🎨 Custom LUT ഉപയോഗിക്കുന്നു: {os.path.basename(lut_path)}")
-          else:
-              lut_path = "work/munnar_cinematic.cube"
-              with open(lut_path, "w") as f:
-                  f.write("TITLE \"Munnar Cinematic\"\nLUT_3D_SIZE 2\n")
-                  # 8 corners (R G B): പച്ചപ്പിന് തെളിച്ചവും ഷാഡോയ്ക്ക് തണുത്ത ടോണും
-                  points = [
-                      (0.02, 0.04, 0.06), (0.96, 0.05, 0.05),
-                      (0.03, 0.98, 0.06), (0.98, 0.96, 0.08),
-                      (0.03, 0.06, 0.96), (0.96, 0.06, 0.96),
-                      (0.04, 0.98, 0.98), (0.99, 0.98, 0.96)
-                  ]
-                  for r, g, b in points:
-                      f.write(f"{r:.4f} {g:.4f} {b:.4f}\n")
-              print("🎨 Built-in Munnar Cinematic LUT അപ്ലൈ ചെയ്യുന്നു...")
-
           def get_info(p):
               out = subprocess.check_output([
                   'ffprobe', '-v', 'error', '-select_streams', 'v:0',
                   '-show_entries', 'stream=width,height:format=duration',
                   '-of', 'default=noprint_wrappers=1:nokey=1', p
               ]).decode().strip().splitlines()
-              return int(out[0]), int(out[1]), float(out[2])
+              aud = subprocess.check_output([
+                  'ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                  '-show_entries', 'stream=codec_type',
+                  '-of', 'default=noprint_wrappers=1:nokey=1', p
+              ]).decode().strip()
+              return int(out[0]), int(out[1]), float(out[2]), bool(aud)
 
           infos = [get_info(c) for c in clips]
           durs = [x[2] for x in infos]
@@ -74,7 +60,17 @@ jobs:
           W, H = (1080, 1920) if infos[0][1] > infos[0][0] else (1920, 1080)
           parts, idx_p = [], 0
 
-          for i, (c, d) in enumerate(zip(clips, durs)):
+          # Built-in Munnar Cinematic Color Grade (പച്ചപ്പിനും കോടമഞ്ഞിനും ചേർന്ന ടോൺ)
+          default_color = "colorbalance=rs=-0.03:gs=0.02:bs=0.04:rh=0.04:gh=0.02:bh=-0.03,eq=contrast=1.08:saturation=1.18:brightness=0.01"
+          if lut_files:
+              print(f"🎨 Custom LUT കണ്ടെത്തി: {os.path.basename(lut_files[0])}")
+              color_filter = f"lut3d=file='{lut_files[0]}':interp=trilinear,eq=contrast=1.05:saturation=1.12"
+          else:
+              print("🎨 Built-in Munnar Cinematic Color Grade ഉപയോഗിക്കുന്നു...")
+              color_filter = default_color
+
+          for i, (c, info) in enumerate(zip(clips, infos)):
+              _, _, d, has_audio = info
               trim_start = 0.6 if d > 4.0 else 0.0
               usable_d = max(1.5, d - (trim_start * 2))
               alloc = max(2.2, (d / total) * TARGET_SECONDS)
@@ -89,26 +85,56 @@ jobs:
               for st, cd in segs:
                   trf, out = f"work/t_{idx_p}.trf", f"work/p_{idx_p:04d}.mp4"
                   sp = f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2"
-                  subprocess.run(['ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c, '-vf', f'{sp},vidstabdetect=shakiness=5:accuracy=8:result={trf}', '-f', 'null', '-'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                  
-                  vf = f"{sp},vidstabtransform=input={trf}:smoothing=14:zoom=4,lut3d=file='{lut_path}':interp=trilinear,eq=contrast=1.05:saturation=1.12"
-                  af = "highpass=f=180,afftdn=nf=-25,volume=0.55"
-                  
                   subprocess.run([
                       'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
-                      '-vf', vf, '-af', af, '-r', '30',
-                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '26',
-                      '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out
+                      '-vf', f'{sp},vidstabdetect=shakiness=5:accuracy=8:result={trf}',
+                      '-f', 'null', '-'
                   ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                  vf = f"{sp},vidstabtransform=input={trf}:smoothing=14:zoom=4,{color_filter}"
+
+                  if has_audio:
+                      cmd = [
+                          'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
+                          '-vf', vf, '-af', 'highpass=f=180,afftdn=nf=-25,volume=0.55',
+                          '-r', '30', '-c:v', 'libx264', '-preset', 'fast', '-crf', '26',
+                          '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out
+                      ]
+                  else:
+                      cmd = [
+                          'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
+                          '-f', 'lavfi', '-t', str(cd), '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                          '-vf', vf, '-map', '0:v:0', '-map', '1:a:0',
+                          '-r', '30', '-c:v', 'libx264', '-preset', 'fast', '-crf', '26',
+                          '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out
+                      ]
+
+                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  if res.returncode != 0 and lut_files:
+                      # Custom LUT പരാജയപ്പെട്ടാൽ Built-in കളറിലേക്ക് മാറുന്നു
+                      vf_fallback = f"{sp},vidstabtransform=input={trf}:smoothing=14:zoom=4,{default_color}"
+                      cmd[cmd.index('-vf') + 1] = vf_fallback
+                      res = subprocess.run(cmd, capture_output=True, text=True)
+
                   if os.path.exists(out):
                       parts.append(out)
                       idx_p += 1
+                  else:
+                      print(f"⚠️ Segment {idx_p} failed:", res.stderr[-300:])
+
+          if not parts:
+              raise RuntimeError("No video segments were rendered! Check FFmpeg logs above.")
 
           with open("work/list.txt", "w") as f:
               for p in parts:
                   f.write(f"file '{os.path.abspath(p)}'\n")
 
-          subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', 'work/list.txt', '-c', 'copy', 'work/merged.mp4'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          merge_res = subprocess.run([
+              'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', 'work/list.txt',
+              '-c', 'copy', 'work/merged.mp4'
+          ], capture_output=True, text=True)
+          if merge_res.returncode != 0:
+              raise RuntimeError(f"Merge failed: {merge_res.stderr}")
 
           if bgm:
               subprocess.run([
@@ -119,37 +145,37 @@ jobs:
           else:
               shutil.move('work/merged.mp4', FINAL_FILE)
 
-          # Google Drive-ലേക്ക് നേരിട്ട് അപ്‌ലോഡ് ചെയ്യുന്നു (Secrets സെറ്റ് ചെയ്തിട്ടുണ്ടെങ്കിൽ)
+          # Google Drive-ലേക്ക് നേരിട്ട് അപ്‌ലോഡ് ചെയ്യുന്നു
           cid = os.environ.get("GDRIVE_CLIENT_ID")
           csec = os.environ.get("GDRIVE_CLIENT_SECRET")
           rtok = os.environ.get("GDRIVE_REFRESH_TOKEN")
           m = re.search(r'folders/([a-zA-Z0-9_-]+)', DRIVE_LINK)
 
-          if cid and csec and rtok and m:
-              print("☁️ Google Drive-ലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...")
-              folder_id = m.group(1)
-              tok_res = requests.post("https://oauth2.googleapis.com/token", data={
-                  "client_id": cid, "client_secret": csec,
-                  "refresh_token": rtok, "grant_type": "refresh_token"
-              }).json()
-              access_token = tok_res.get("access_token")
-              if access_token:
-                  headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"}
-                  meta = {"name": FINAL_FILE, "parents": [folder_id]}
-                  init = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", headers=headers, data=json.dumps(meta))
-                  upload_url = init.headers.get("Location")
-                  if upload_url:
-                      with open(FINAL_FILE, "rb") as vf_data:
-                          up = requests.put(upload_url, data=vf_data)
-                      if up.status_code in (200, 201):
-                          print("🎉 വീഡിയോ വിജയകരമായി Google Drive-ലെ RawVlog ഫോൾഡറിൽ സേവ് ആയി!")
+          if not (cid and csec and rtok and m):
+              raise RuntimeError("Google Drive Secrets അല്ലെങ്കിൽ Folder Link കൃത്യമല്ല!")
+
+          print("☁️ Google Drive-ലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...")
+          folder_id = m.group(1)
+          tok_res = requests.post("https://oauth2.googleapis.com/token", data={
+              "client_id": cid, "client_secret": csec,
+              "refresh_token": rtok, "grant_type": "refresh_token"
+          }).json()
+          access_token = tok_res.get("access_token")
+          if not access_token:
+              raise RuntimeError(f"Token error: {tok_res}")
+
+          headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"}
+          meta = {"name": FINAL_FILE, "parents": [folder_id]}
+          init = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", headers=headers, data=json.dumps(meta))
+          upload_url = init.headers.get("Location")
+          if not upload_url:
+              raise RuntimeError(f"Drive upload init failed: {init.text}")
+
+          with open(FINAL_FILE, "rb") as vf_data:
+              up = requests.put(upload_url, data=vf_data)
+          if up.status_code in (200, 201):
+              print("🎉 വീഡിയോ വിജയകരമായി Google Drive-ലെ RawVlog ഫോൾഡറിൽ സേവ് ആയി!")
           else:
-              print("ℹ️ Drive Secrets നൽകാത്തതിനാൽ GitHub Artifact ആയി മാത്രം സേവ് ചെയ്യുന്നു.")
+              raise RuntimeError(f"Drive upload failed: {up.status_code} {up.text}")
           EOF
           python edit.py
-
-      - name: Upload Backup Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Munnar-Vlog-3Min
-          path: Final_Munnar_Vlog_3Min.mp4
