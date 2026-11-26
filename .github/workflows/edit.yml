@@ -159,7 +159,7 @@ jobs:
               except Exception:
                   return []
 
-          # 2. Voice-Aware Detection (മുഖമില്ലാതെ പിന്നണിയിൽ സംസാരിക്കുന്ന ഭാഗങ്ങൾ കണ്ടെത്തുന്നു)
+          # 2. Voice-Aware Detection
           def get_speech_intervals(video_path, duration):
               res = subprocess.run([
                   'ffmpeg', '-i', video_path, '-af', 'highpass=f=180,silencedetect=noise=-28dB:d=0.6',
@@ -190,7 +190,7 @@ jobs:
                   speech.append((max(0.0, cur - 0.25), duration))
               return speech
 
-          # 3. Dead-Air / Silence Trimmer (0.8s-ൽ കൂടുതലുള്ള നിശ്ശബ്ദത ഒഴിവാക്കുന്നു)
+          # 3. Dead-Air / Silence Trimmer
           def remove_dead_air(video_path, base_intervals):
               res = subprocess.run([
                   'ffmpeg', '-i', video_path, '-af', 'silencedetect=noise=-32dB:d=0.8',
@@ -230,12 +230,51 @@ jobs:
               return refined if refined else base_intervals
 
           infos = [get_info(c) for c in clips]
-          durs = [x[2] for x in infos]
-          total = sum(durs)
           W, H = (1080, 1920) if infos[0][1] > infos[0][0] else (1920, 1080)
           parts, idx_p = [], 0
 
-          # 4. Auto-Exposure & White Balance + Color Grade
+          # 4. Pre-scan clips to calculate Protected Duration vs B-Roll Budget
+          clip_plans = []
+          protected_dur = 0.0
+          broll_total_dur = 0.0
+
+          for c, info in zip(clips, infos):
+              _, _, d, has_audio = info
+              cname = os.path.basename(c)
+
+              if d <= 7.0 or TARGET_SECONDS == 0:
+                  segs = [(0.0, d)]
+                  protected_dur += d
+                  clip_plans.append((c, info, "full", segs))
+              else:
+                  face_segs = get_face_intervals(c, d)
+                  speech_segs = get_speech_intervals(c, d) if (not face_segs and has_audio) else []
+
+                  if face_segs:
+                      if TRIM_SILENCE == "on" and has_audio:
+                          face_segs = remove_dead_air(c, face_segs)
+                      segs = [(s, e - s) for s, e in face_segs if (e - s) >= 0.8]
+                      protected_dur += sum(cd for _, cd in segs)
+                      clip_plans.append((c, info, "face", segs))
+                  elif speech_segs:
+                      if TRIM_SILENCE == "off":
+                          speech_segs = [(0.0, d)]
+                      segs = [(s, e - s) for s, e in speech_segs if (e - s) >= 0.8]
+                      protected_dur += sum(cd for _, cd in segs)
+                      clip_plans.append((c, info, "speech", segs))
+                  else:
+                      broll_total_dur += d
+                      clip_plans.append((c, info, "broll", []))
+
+          # 2.5s Alternating Cut Ratio based on Target Duration
+          SEG_LEN = 2.5
+          if broll_total_dur > 0:
+              remaining_budget = max(0.0, TARGET_SECONDS - protected_dur)
+              broll_ratio = min(1.0, max(0.10, remaining_budget / broll_total_dur))
+              step_interval = SEG_LEN / broll_ratio
+              print(f"⏱️ Target: {TARGET_SECONDS}s | Protected: {protected_dur:.1f}s | B-Roll Ratio: {broll_ratio*100:.0f}% (Every {step_interval:.1f}s -> 2.5s cut)")
+
+          # 5. Auto-Exposure & White Balance + Color Grade
           auto_wb_exp = "normalize=independence=0:strength=0.30:smoothing=15"
           presets = {
               "cinematic": f"{auto_wb_exp},colorbalance=rs=-0.03:gs=0.02:bs=0.04:rh=0.04:gh=0.02:bh=-0.03,eq=contrast=1.07:saturation=1.15",
@@ -252,7 +291,7 @@ jobs:
               print(f"🎨 Auto-Exposure & White Balance + Preset: {COLOR_GRADE}")
               color_filter = default_color
 
-          # 5. Audio Engine: 100% Normal Voice + 35% Ambient Sound
+          # 6. Audio Engine: 100% Normal Voice + 35% Ambient Sound
           def run_encode(c, st, cd, vf_str, has_audio, smart_audio, out_path):
               if os.path.exists(out_path):
                   os.remove(out_path)
@@ -277,39 +316,25 @@ jobs:
                   ]
               return subprocess.run(cmd, capture_output=True, text=True)
 
-          for i, (c, info) in enumerate(zip(clips, infos)):
+          for c, info, mode, segs in clip_plans:
               _, _, d, has_audio = info
               cname = os.path.basename(c)
 
-              if d <= 7.0 or TARGET_SECONDS == 0:
+              if mode == "full":
                   print(f"🎬 [{cname}] {d:.1f}s -> കട്ട് ചെയ്യാതെ പൂർണ്ണമായി എടുക്കുന്നു")
-                  segs = [(0.0, d)]
+              elif mode == "face":
+                  print(f"🧑 [{cname}] {d:.1f}s -> മുഖം കാണുന്ന {len(segs)} ഭാഗങ്ങൾ സംരക്ഷിക്കുന്നു")
+              elif mode == "speech":
+                  print(f"🎙️ [{cname}] {d:.1f}s -> പിന്നണിയിൽ സംസാരിക്കുന്ന {len(segs)} ഭാഗങ്ങൾ സംരക്ഷിക്കുന്നു")
               else:
-                  face_segs = get_face_intervals(c, d)
-                  speech_segs = get_speech_intervals(c, d) if (not face_segs and has_audio) else []
-
-                  if face_segs:
-                      if TRIM_SILENCE == "on" and has_audio:
-                          face_segs = remove_dead_air(c, face_segs)
-                      print(f"🧑 [{cname}] {d:.1f}s -> മുഖം കാണുന്ന {len(face_segs)} ഭാഗങ്ങൾ പരിധിയില്ലാതെ സംരക്ഷിക്കുന്നു")
-                      segs = [(s, e - s) for s, e in face_segs if (e - s) >= 0.8]
-                  elif speech_segs:
-                      if TRIM_SILENCE == "off":
-                          speech_segs = [(0.0, d)]
-                      print(f"🎙️ [{cname}] {d:.1f}s -> പിന്നണിയിൽ സംസാരിക്കുന്ന {len(speech_segs)} ഭാഗങ്ങൾ പരിധിയില്ലാതെ സംരക്ഷിക്കുന്നു")
-                      segs = [(s, e - s) for s, e in speech_segs if (e - s) >= 0.8]
-                  else:
-                      trim_start = 0.5
-                      usable_d = max(2.0, d - 1.0)
-                      seg_len = 4.5
-                      alloc = max(seg_len, (d / total) * TARGET_SECONDS)
-                      if usable_d <= seg_len:
-                          segs = [(trim_start, usable_d)]
-                      else:
-                          n_seg = max(1, int(alloc // seg_len))
-                          step = (usable_d - seg_len) / max(1, n_seg - 1) if n_seg > 1 else 0
-                          segs = [(trim_start + (k * step), seg_len) for k in range(n_seg)]
-                      print(f"🏞️ [{cname}] {d:.1f}s -> സംസാരമില്ലാത്ത B-Roll 4.5s വീതമുള്ള {len(segs)} കട്ടുകൾ എടുക്കുന്നു")
+                  segs = []
+                  t = 0.0
+                  while t + 1.2 <= d:
+                      segs.append((t, min(SEG_LEN, d - t)))
+                      t += step_interval
+                  if not segs:
+                      segs = [(0.0, min(SEG_LEN, d))]
+                  print(f"🏞️ [{cname}] {d:.1f}s -> 2.5s വീതമുള്ള {len(segs)} കട്ടുകൾ (ഒന്നിടവിട്ട്) എടുക്കുന്നു")
 
               for st, cd in segs:
                   trf, out = f"work/t_{idx_p}.trf", f"work/p_{idx_p:04d}.mp4"
