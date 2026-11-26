@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          pip install -q gdown requests opencv-python-headless
+          pip install -q gdown requests opencv-contrib-python-headless
 
       - name: Run Pro Cloud Video Editor
         env:
@@ -58,8 +58,13 @@ jobs:
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
         run: |
           cat << 'EOF' > edit.py
-          import os, re, glob, json, subprocess, shutil, requests, cv2
+          import os, re, glob, json, subprocess, shutil, requests
           from datetime import datetime, timezone, timedelta
+
+          try:
+              import cv2
+          except Exception:
+              cv2 = None
 
           DRIVE_LINK = os.environ.get("DRIVE_LINK", "").strip()
           RAW_TITLE = os.environ.get("VIDEO_TITLE", "Edited_Vlog").strip()
@@ -101,44 +106,58 @@ jobs:
               ]).decode().strip()
               return int(out[0]), int(out[1]), float(out[2]), bool(aud)
 
-          # 1. Face-Aware Detection (OpenCV)
-          face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+          # 1. Safe Face-Aware Detection (OpenCV)
+          face_cascade = None
+          if cv2 is not None:
+              try:
+                  xml_path = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
+                  if hasattr(cv2, 'CascadeClassifier') and os.path.exists(xml_path):
+                      face_cascade = cv2.CascadeClassifier(xml_path)
+                  elif hasattr(cv2, 'objdetect') and hasattr(cv2.objdetect, 'CascadeClassifier') and os.path.exists(xml_path):
+                      face_cascade = cv2.objdetect.CascadeClassifier(xml_path)
+              except Exception as e:
+                  print(f"⚠️ Face detector skipped ({e}), continuing with audio/motion detection.")
 
           def get_face_intervals(video_path, duration):
-              cap = cv2.VideoCapture(video_path)
-              fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-              step_frames = max(1, int(fps * 0.5))
-              face_times = []
-              frame_idx = 0
-
-              while True:
-                  ret, frame = cap.read()
-                  if not ret:
-                      break
-                  if frame_idx % step_frames == 0:
-                      small = cv2.resize(frame, (320, 180))
-                      gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                      faces = face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20))
-                      if len(faces) > 0:
-                          face_times.append(frame_idx / fps)
-                  frame_idx += 1
-              cap.release()
-
-              if not face_times:
+              if face_cascade is None or cv2 is None:
                   return []
+              try:
+                  cap = cv2.VideoCapture(video_path)
+                  fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                  step_frames = max(1, int(fps * 0.5))
+                  face_times = []
+                  frame_idx = 0
 
-              intervals = []
-              start_t = max(0.0, face_times[0] - 0.5)
-              prev_t = face_times[0]
-              for t in face_times[1:]:
-                  if t - prev_t <= 1.5:
-                      prev_t = t
-                  else:
-                      intervals.append((start_t, min(duration, prev_t + 0.6)))
-                      start_t = max(0.0, t - 0.5)
-                      prev_t = t
-              intervals.append((start_t, min(duration, prev_t + 0.6)))
-              return [(s, e) for s, e in intervals if (e - s) >= 1.2]
+                  while True:
+                      ret, frame = cap.read()
+                      if not ret:
+                          break
+                      if frame_idx % step_frames == 0:
+                          small = cv2.resize(frame, (320, 180))
+                          gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                          faces = face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20))
+                          if len(faces) > 0:
+                              face_times.append(frame_idx / fps)
+                      frame_idx += 1
+                  cap.release()
+
+                  if not face_times:
+                      return []
+
+                  intervals = []
+                  start_t = max(0.0, face_times[0] - 0.5)
+                  prev_t = face_times[0]
+                  for t in face_times[1:]:
+                      if t - prev_t <= 1.5:
+                          prev_t = t
+                      else:
+                          intervals.append((start_t, min(duration, prev_t + 0.6)))
+                          start_t = max(0.0, t - 0.5)
+                          prev_t = t
+                  intervals.append((start_t, min(duration, prev_t + 0.6)))
+                  return [(s, e) for s, e in intervals if (e - s) >= 1.2]
+              except Exception:
+                  return []
 
           # 2. Dead-Air / Silence Trimmer (0.8s-ൽ കൂടുതലുള്ള നിശ്ശബ്ദത ഒഴിവാക്കുന്നു)
           def remove_dead_air(video_path, base_intervals):
@@ -165,7 +184,7 @@ jobs:
                   return base_intervals
 
               refined = []
-              pad = 0.22  # വാക്കുകൾ മുറിയാതിരിക്കാൻ 0.22s മാർജിൻ
+              pad = 0.22
               for s, e in base_intervals:
                   cur = s
                   for sil_s, sil_e in silences:
@@ -208,7 +227,6 @@ jobs:
                   os.remove(out_path)
               if has_audio:
                   if smart_audio:
-                      # സംസാരം 100% Normal ആയി നിലനിർത്തുകയും, അന്തരീക്ഷ ശബ്ദം 35% (-9dB) ആയി കുറയ്ക്കുകയും ചെയ്യുന്നു
                       af_str = "highpass=f=160,compand=attacks=0.05:decays=0.35:points=-70/-79|-35/-44|-24/-24|0/-1:soft-knee=6,loudnorm=I=-16:TP=-1.5:LRA=11"
                   else:
                       af_str = "highpass=f=160,volume=0.85"
@@ -232,7 +250,6 @@ jobs:
               _, _, d, has_audio = info
               cname = os.path.basename(c)
 
-              # 7 സെക്കൻഡോ അതിൽ താഴെയോ ആണെങ്കിൽ കട്ട് ചെയ്യാതെ പൂർണ്ണമായി എടുക്കുന്നു
               if d <= 7.0 or TARGET_SECONDS == 0:
                   print(f"🎬 [{cname}] {d:.1f}s -> കട്ട് ചെയ്യാതെ പൂർണ്ണമായി എടുക്കുന്നു")
                   segs = [(0.0, d)]
@@ -297,7 +314,6 @@ jobs:
           if merge_res.returncode != 0:
               raise RuntimeError(f"Merge failed: {merge_res.stderr}")
 
-          # Smart BGM Ducking (സംസാരിക്കുമ്പോൾ BGM തനിയെ താഴുന്നു)
           if bgm:
               print("🎵 Smart Audio Ducking ഉപയോഗിച്ച് BGM ചേർക്കുന്നു...")
               duck_filter = (
@@ -316,7 +332,6 @@ jobs:
           else:
               shutil.move('work/merged.mp4', FINAL_FILE)
 
-          # Google Drive Upload
           cid = os.environ.get("GDRIVE_CLIENT_ID")
           csec = os.environ.get("GDRIVE_CLIENT_SECRET")
           rtok = os.environ.get("GDRIVE_REFRESH_TOKEN")
