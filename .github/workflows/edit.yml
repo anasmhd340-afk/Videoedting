@@ -9,55 +9,147 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          pip install -q gdown
+          pip install -q gdown requests
 
-      - name: Download & Edit Vlog
+      - name: Download, Edit & Upload Vlog
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
         run: |
           cat << 'EOF' > edit.py
-          import os, glob, subprocess, shutil
+          import os, re, glob, json, subprocess, shutil, requests
+
           DRIVE_LINK = "https://drive.google.com/drive/folders/1tUd2HNXpDTPRekMlnOiYqDbcpi6Th-fx"
+          TARGET_SECONDS = 180  # 3 മിനിറ്റ് ഹൈലൈറ്റ് കട്ട്
+          SEG_LEN = 2.2
+          FINAL_FILE = "Final_Munnar_Vlog_3Min.mp4"
+
           os.makedirs("raw", exist_ok=True)
           os.makedirs("work", exist_ok=True)
+
+          print("📥 Google Drive-ൽ നിന്ന് ഫയലുകൾ ഡൗൺലോഡ് ചെയ്യുന്നു...")
           os.system(f'gdown --folder "{DRIVE_LINK}" -O raw --continue')
-          clips = sorted([c for c in glob.glob("raw/**/*.*", recursive=True) if c.lower().endswith(('.mp4', '.mov', '.mkv')) and "Final_" not in c])
+
+          clips = sorted([
+              c for c in glob.glob("raw/**/*.*", recursive=True)
+              if c.lower().endswith(('.mp4', '.mov', '.mkv')) and "Final_" not in c
+          ])
           bgm = glob.glob("raw/**/bgm.mp3", recursive=True)
+          lut_files = glob.glob("raw/**/*.cube", recursive=True)
+
           if not clips:
               raise FileNotFoundError("No videos downloaded! Check Drive folder link and permissions.")
+
+          # .cube LUT ഫോൾഡറിൽ ഇല്ലെങ്കിൽ മൂന്നാറിന് ചേർന്ന Cinematic LUT നിർമ്മിക്കുന്നു
+          if lut_files:
+              lut_path = lut_files[0]
+              print(f"🎨 Custom LUT ഉപയോഗിക്കുന്നു: {os.path.basename(lut_path)}")
+          else:
+              lut_path = "work/munnar_cinematic.cube"
+              with open(lut_path, "w") as f:
+                  f.write("TITLE \"Munnar Cinematic\"\nLUT_3D_SIZE 2\n")
+                  # 8 corners (R G B): പച്ചപ്പിന് തെളിച്ചവും ഷാഡോയ്ക്ക് തണുത്ത ടോണും
+                  points = [
+                      (0.02, 0.04, 0.06), (0.96, 0.05, 0.05),
+                      (0.03, 0.98, 0.06), (0.98, 0.96, 0.08),
+                      (0.03, 0.06, 0.96), (0.96, 0.06, 0.96),
+                      (0.04, 0.98, 0.98), (0.99, 0.98, 0.96)
+                  ]
+                  for r, g, b in points:
+                      f.write(f"{r:.4f} {g:.4f} {b:.4f}\n")
+              print("🎨 Built-in Munnar Cinematic LUT അപ്ലൈ ചെയ്യുന്നു...")
+
           def get_info(p):
-              out = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', p]).decode().strip().splitlines()
+              out = subprocess.check_output([
+                  'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                  '-show_entries', 'stream=width,height:format=duration',
+                  '-of', 'default=noprint_wrappers=1:nokey=1', p
+              ]).decode().strip().splitlines()
               return int(out[0]), int(out[1]), float(out[2])
+
           infos = [get_info(c) for c in clips]
           durs = [x[2] for x in infos]
           total = sum(durs)
           W, H = (1080, 1920) if infos[0][1] > infos[0][0] else (1920, 1080)
           parts, idx_p = [], 0
-          SEG_LEN = 2.2
+
           for i, (c, d) in enumerate(zip(clips, durs)):
-              alloc = max(2.5, (d / total) * 315) if total > 315 else d
-              if d <= alloc or d <= 3.0:
-                  segs = [(0.0, d)]
+              trim_start = 0.6 if d > 4.0 else 0.0
+              usable_d = max(1.5, d - (trim_start * 2))
+              alloc = max(2.2, (d / total) * TARGET_SECONDS)
+
+              if usable_d <= alloc or usable_d <= 3.0:
+                  segs = [(trim_start, usable_d)]
               else:
                   n_seg = max(1, int(alloc // SEG_LEN))
-                  step = (d - SEG_LEN) / max(1, n_seg)
-                  segs = [(k * step, SEG_LEN) for k in range(n_seg)]
+                  step = (usable_d - SEG_LEN) / max(1, n_seg - 1) if n_seg > 1 else 0
+                  segs = [(trim_start + (k * step), SEG_LEN) for k in range(n_seg)]
+
               for st, cd in segs:
                   trf, out = f"work/t_{idx_p}.trf", f"work/p_{idx_p:04d}.mp4"
                   sp = f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2"
                   subprocess.run(['ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c, '-vf', f'{sp},vidstabdetect=shakiness=5:accuracy=8:result={trf}', '-f', 'null', '-'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                  subprocess.run(['ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c, '-vf', f"{sp},vidstabtransform=input={trf}:smoothing=14:zoom=4,eq=contrast=1.07:saturation=1.16:brightness=0.01", '-af', 'volume=0.55', '-r', '30', '-c:v', 'libx264', '-preset', 'fast', '-crf', '26', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                  if os.path.exists(out): parts.append(out); idx_p += 1
+                  
+                  vf = f"{sp},vidstabtransform=input={trf}:smoothing=14:zoom=4,lut3d=file='{lut_path}':interp=trilinear,eq=contrast=1.05:saturation=1.12"
+                  af = "highpass=f=180,afftdn=nf=-25,volume=0.55"
+                  
+                  subprocess.run([
+                      'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
+                      '-vf', vf, '-af', af, '-r', '30',
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '26',
+                      '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out
+                  ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  if os.path.exists(out):
+                      parts.append(out)
+                      idx_p += 1
+
           with open("work/list.txt", "w") as f:
-              for p in parts: f.write(f"file '{os.path.abspath(p)}'\n")
+              for p in parts:
+                  f.write(f"file '{os.path.abspath(p)}'\n")
+
           subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', 'work/list.txt', '-c', 'copy', 'work/merged.mp4'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
           if bgm:
-              subprocess.run(['ffmpeg', '-y', '-i', 'work/merged.mp4', '-stream_loop', '-1', '-i', bgm[0], '-filter_complex', '[0:a]volume=1.0[orig];[1:a]volume=0.15[b];[orig][b]amix=inputs=2:duration=first:dropout_transition=2[aout]', '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', 'Final_Munnar_Vlog_5Min.mp4'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.run([
+                  'ffmpeg', '-y', '-i', 'work/merged.mp4', '-stream_loop', '-1', '-i', bgm[0],
+                  '-filter_complex', '[0:a]volume=1.0[orig];[1:a]volume=0.15[b];[orig][b]amix=inputs=2:duration=first:dropout_transition=2[aout]',
+                  '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', FINAL_FILE
+              ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
           else:
-              shutil.move('work/merged.mp4', 'Final_Munnar_Vlog_5Min.mp4')
+              shutil.move('work/merged.mp4', FINAL_FILE)
+
+          # Google Drive-ലേക്ക് നേരിട്ട് അപ്‌ലോഡ് ചെയ്യുന്നു (Secrets സെറ്റ് ചെയ്തിട്ടുണ്ടെങ്കിൽ)
+          cid = os.environ.get("GDRIVE_CLIENT_ID")
+          csec = os.environ.get("GDRIVE_CLIENT_SECRET")
+          rtok = os.environ.get("GDRIVE_REFRESH_TOKEN")
+          m = re.search(r'folders/([a-zA-Z0-9_-]+)', DRIVE_LINK)
+
+          if cid and csec and rtok and m:
+              print("☁️ Google Drive-ലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...")
+              folder_id = m.group(1)
+              tok_res = requests.post("https://oauth2.googleapis.com/token", data={
+                  "client_id": cid, "client_secret": csec,
+                  "refresh_token": rtok, "grant_type": "refresh_token"
+              }).json()
+              access_token = tok_res.get("access_token")
+              if access_token:
+                  headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"}
+                  meta = {"name": FINAL_FILE, "parents": [folder_id]}
+                  init = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", headers=headers, data=json.dumps(meta))
+                  upload_url = init.headers.get("Location")
+                  if upload_url:
+                      with open(FINAL_FILE, "rb") as vf_data:
+                          up = requests.put(upload_url, data=vf_data)
+                      if up.status_code in (200, 201):
+                          print("🎉 വീഡിയോ വിജയകരമായി Google Drive-ലെ RawVlog ഫോൾഡറിൽ സേവ് ആയി!")
+          else:
+              print("ℹ️ Drive Secrets നൽകാത്തതിനാൽ GitHub Artifact ആയി മാത്രം സേവ് ചെയ്യുന്നു.")
           EOF
           python edit.py
 
-      - name: Upload Final Video
+      - name: Upload Backup Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Munnar-Vlog-5Min
-          path: Final_Munnar_Vlog_5Min.mp4
+          name: Munnar-Vlog-3Min
+          path: Final_Munnar_Vlog_3Min.mp4
