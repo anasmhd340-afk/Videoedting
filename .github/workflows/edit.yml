@@ -87,8 +87,11 @@ jobs:
               c for c in glob.glob("raw/**/*.*", recursive=True)
               if c.lower().endswith(('.mp4', '.mov', '.mkv')) and not os.path.basename(c).startswith(SAFE_TITLE)
           ])
-          bgm = glob.glob("raw/**/bgm.mp3", recursive=True)
-          lut_files = glob.glob("raw/**/*.cube", recursive=True)
+          bgm_files = sorted([
+              a for a in glob.glob("raw/**/*.*", recursive=True)
+              if a.lower().endswith(('.mp3', '.m4a', '.wav', '.aac', '.ogg'))
+          ])
+          lut_files = sorted(glob.glob("raw/**/*.cube", recursive=True))
 
           if not clips:
               raise FileNotFoundError("No videos downloaded! Check Drive folder link and 'Anyone with the link' permission.")
@@ -240,7 +243,6 @@ jobs:
 
           for c, info in zip(clips, infos):
               _, _, d, has_audio = info
-              cname = os.path.basename(c)
 
               if d <= 7.0 or TARGET_SECONDS == 0:
                   segs = [(0.0, d)]
@@ -380,8 +382,9 @@ jobs:
           if merge_res.returncode != 0:
               raise RuntimeError(f"Merge failed: {merge_res.stderr}")
 
-          if bgm:
-              print("🎵 Smart Audio Ducking ഉപയോഗിച്ച് BGM ചേർക്കുന്നു...")
+          if bgm_files:
+              selected_bgm = bgm_files[0]
+              print(f"🎵 BGM കണ്ടെത്തി: {os.path.basename(selected_bgm)} (Smart Audio Ducking ചേർക്കുന്നു...)")
               duck_filter = (
                   "[1:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.25[bg];"
                   "[0:a]asplit=2[orig][sc];"
@@ -389,11 +392,12 @@ jobs:
                   "[orig][bg_ducked]amix=inputs=2:duration=first:dropout_transition=2[aout]"
               )
               bgm_res = subprocess.run([
-                  'ffmpeg', '-y', '-i', 'work/merged.mp4', '-stream_loop', '-1', '-i', bgm[0],
+                  'ffmpeg', '-y', '-i', 'work/merged.mp4', '-stream_loop', '-1', '-i', selected_bgm,
                   '-filter_complex', duck_filter,
                   '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', FINAL_FILE
               ], capture_output=True, text=True)
               if bgm_res.returncode != 0:
+                  print("⚠️ BGM mix failed, saving without BGM:", bgm_res.stderr[-200:])
                   shutil.move('work/merged.mp4', FINAL_FILE)
           else:
               shutil.move('work/merged.mp4', FINAL_FILE)
