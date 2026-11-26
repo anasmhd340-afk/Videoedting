@@ -15,7 +15,7 @@ on:
       target_seconds:
         description: 'Target Duration in Seconds (0 = Keep all clips full)'
         required: true
-        default: '180'
+        default: '240'
         type: string
       trim_silence:
         description: 'Dead-Air / Silence Trimmer (Auto Jump-Cut on Talking Clips)'
@@ -69,7 +69,7 @@ jobs:
           DRIVE_LINK = os.environ.get("DRIVE_LINK", "").strip()
           RAW_TITLE = os.environ.get("VIDEO_TITLE", "Edited_Vlog").strip()
           SAFE_TITLE = re.sub(r'[^a-zA-Z0-9_-]', '_', RAW_TITLE) or "Edited_Vlog"
-          TARGET_SECONDS = int(os.environ.get("TARGET_SECONDS", "180") or "180")
+          TARGET_SECONDS = int(os.environ.get("TARGET_SECONDS", "240") or "240")
           TRIM_SILENCE = os.environ.get("TRIM_SILENCE", "on").strip()
           COLOR_GRADE = os.environ.get("COLOR_GRADE", "cinematic").strip()
 
@@ -162,10 +162,11 @@ jobs:
               except Exception:
                   return []
 
-          # 2. Voice-Aware Detection
+          # 2. Human Vocal-Band Speech Detection (കാറ്റും വണ്ടിയുടെ ശബ്ദവും ഒഴിവാക്കി സംസാരം മാത്രം തിരിച്ചറിയുന്നു)
           def get_speech_intervals(video_path, duration):
               res = subprocess.run([
-                  'ffmpeg', '-i', video_path, '-af', 'highpass=f=180,silencedetect=noise=-28dB:d=0.6',
+                  'ffmpeg', '-i', video_path,
+                  '-af', 'highpass=f=300,lowpass=f=3000,silencedetect=noise=-22dB:d=0.6',
                   '-f', 'null', '-'
               ], capture_output=True, text=True)
               silences = []
@@ -186,17 +187,18 @@ jobs:
               speech = []
               cur = 0.0
               for sil_s, sil_e in silences:
-                  if sil_s - cur >= 0.9:
-                      speech.append((max(0.0, cur - 0.25), min(duration, sil_s + 0.25)))
+                  if sil_s - cur >= 1.2:
+                      speech.append((max(0.0, cur - 0.20), min(duration, sil_s + 0.20)))
                   cur = sil_e
-              if duration - cur >= 0.9:
-                  speech.append((max(0.0, cur - 0.25), duration))
+              if duration - cur >= 1.2:
+                  speech.append((max(0.0, cur - 0.20), duration))
               return speech
 
           # 3. Dead-Air / Silence Trimmer
           def remove_dead_air(video_path, base_intervals):
               res = subprocess.run([
-                  'ffmpeg', '-i', video_path, '-af', 'silencedetect=noise=-32dB:d=0.8',
+                  'ffmpeg', '-i', video_path,
+                  '-af', 'highpass=f=250,lowpass=f=3200,silencedetect=noise=-28dB:d=0.8',
                   '-f', 'null', '-'
               ], capture_output=True, text=True)
               silences = []
@@ -236,7 +238,7 @@ jobs:
           W, H = (1080, 1920) if infos[0][1] > infos[0][0] else (1920, 1080)
           parts, idx_p = [], 0
 
-          # 4. Pre-scan clips to calculate Protected Duration vs B-Roll Budget
+          # 4. Pre-scan clips to calculate Protected Duration vs Strict B-Roll Budget
           clip_plans = []
           protected_dur = 0.0
           broll_total_dur = 0.0
@@ -259,8 +261,6 @@ jobs:
                       protected_dur += sum(cd for _, cd in segs)
                       clip_plans.append((c, info, "face", segs))
                   elif speech_segs:
-                      if TRIM_SILENCE == "off":
-                          speech_segs = [(0.0, d)]
                       segs = [(s, e - s) for s, e in speech_segs if (e - s) >= 0.8]
                       protected_dur += sum(cd for _, cd in segs)
                       clip_plans.append((c, info, "speech", segs))
@@ -268,13 +268,11 @@ jobs:
                       broll_total_dur += d
                       clip_plans.append((c, info, "broll", []))
 
-          # 2.5s Alternating Cut Ratio based on Target Duration
+          # Strict B-Roll Budget Calculation (Target സമയം മറികടക്കാതെ നിയന്ത്രിക്കുന്നു)
           SEG_LEN = 2.5
-          if broll_total_dur > 0:
-              remaining_budget = max(0.0, TARGET_SECONDS - protected_dur)
-              broll_ratio = min(1.0, max(0.10, remaining_budget / broll_total_dur))
-              step_interval = SEG_LEN / broll_ratio
-              print(f"⏱️ Target: {TARGET_SECONDS}s | Protected: {protected_dur:.1f}s | B-Roll Ratio: {broll_ratio*100:.0f}% (Every {step_interval:.1f}s -> 2.5s cut)")
+          remaining_budget = max(0.0, TARGET_SECONDS - protected_dur)
+          broll_ratio = min(1.0, remaining_budget / broll_total_dur) if broll_total_dur > 0 else 0.0
+          print(f"⏱️ Target: {TARGET_SECONDS}s | Protected: {protected_dur:.1f}s | B-Roll Budget: {remaining_budget:.1f}s ({broll_ratio*100:.0f}%)")
 
           # 5. Auto-Exposure & White Balance + Color Grade
           auto_wb_exp = "normalize=independence=0:strength=0.30:smoothing=15"
@@ -318,6 +316,7 @@ jobs:
                   ]
               return subprocess.run(cmd, capture_output=True, text=True)
 
+          broll_used = 0.0
           for c, info, mode, segs in clip_plans:
               _, _, d, has_audio = info
               cname = os.path.basename(c)
@@ -330,13 +329,24 @@ jobs:
                   print(f"🎙️ [{cname}] {d:.1f}s -> പിന്നണിയിൽ സംസാരിക്കുന്ന {len(segs)} ഭാഗങ്ങൾ സംരക്ഷിക്കുന്നു")
               else:
                   segs = []
-                  t = 0.0
-                  while t + 1.2 <= d:
-                      segs.append((t, min(SEG_LEN, d - t)))
-                      t += step_interval
-                  if not segs:
-                      segs = [(0.0, min(SEG_LEN, d))]
-                  print(f"🏞️ [{cname}] {d:.1f}s -> 2.5s വീതമുള്ള {len(segs)} കട്ടുകൾ (ഒന്നിടവിട്ട്) എടുക്കുന്നു")
+                  budget_left = max(0.0, remaining_budget - broll_used)
+                  if budget_left >= 1.5 and broll_ratio > 0:
+                      clip_target = min(budget_left, d * broll_ratio)
+                      n_cuts = int(round(clip_target / SEG_LEN))
+                      if n_cuts == 0 and clip_target >= 1.5:
+                          n_cuts = 1
+                      if n_cuts > 0:
+                          step = d / n_cuts
+                          for k in range(n_cuts):
+                              st = k * step
+                              cd = min(SEG_LEN, d - st, remaining_budget - broll_used)
+                              if cd >= 1.2:
+                                  segs.append((st, cd))
+                                  broll_used += cd
+                  if segs:
+                      print(f"🏞️ [{cname}] {d:.1f}s -> 2.5s വീതമുള്ള {len(segs)} കട്ടുകൾ എടുക്കുന്നു (ബാക്കി ഒഴിവാക്കി)")
+                  else:
+                      print(f"⏭️ [{cname}] {d:.1f}s -> Target സമയം തികഞ്ഞതിനാൽ ഒഴിവാക്കുന്നു")
 
               for st, cd in segs:
                   trf, out = f"work/t_{idx_p}.trf", f"work/p_{idx_p:04d}.mp4"
