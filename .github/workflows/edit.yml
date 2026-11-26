@@ -115,8 +115,8 @@ jobs:
                       face_cascade = cv2.CascadeClassifier(xml_path)
                   elif hasattr(cv2, 'objdetect') and hasattr(cv2.objdetect, 'CascadeClassifier') and os.path.exists(xml_path):
                       face_cascade = cv2.objdetect.CascadeClassifier(xml_path)
-              except Exception as e:
-                  print(f"⚠️ Face detector skipped ({e}), continuing with audio/motion detection.")
+              except Exception:
+                  pass
 
           def get_face_intervals(video_path, duration):
               if face_cascade is None or cv2 is None:
@@ -159,7 +159,38 @@ jobs:
               except Exception:
                   return []
 
-          # 2. Dead-Air / Silence Trimmer (0.8s-ൽ കൂടുതലുള്ള നിശ്ശബ്ദത ഒഴിവാക്കുന്നു)
+          # 2. Voice-Aware Detection (മുഖമില്ലാതെ പിന്നണിയിൽ സംസാരിക്കുന്ന ഭാഗങ്ങൾ കണ്ടെത്തുന്നു)
+          def get_speech_intervals(video_path, duration):
+              res = subprocess.run([
+                  'ffmpeg', '-i', video_path, '-af', 'highpass=f=180,silencedetect=noise=-28dB:d=0.6',
+                  '-f', 'null', '-'
+              ], capture_output=True, text=True)
+              silences = []
+              cur_start = None
+              for line in res.stderr.splitlines():
+                  if 'silence_start:' in line:
+                      m = re.search(r'silence_start:\s*([0-9.]+)', line)
+                      if m:
+                          cur_start = float(m.group(1))
+                  elif 'silence_end:' in line and cur_start is not None:
+                      m = re.search(r'silence_end:\s*([0-9.]+)', line)
+                      if m:
+                          silences.append((cur_start, float(m.group(1))))
+                          cur_start = None
+              if cur_start is not None:
+                  silences.append((cur_start, duration))
+
+              speech = []
+              cur = 0.0
+              for sil_s, sil_e in silences:
+                  if sil_s - cur >= 0.9:
+                      speech.append((max(0.0, cur - 0.25), min(duration, sil_s + 0.25)))
+                  cur = sil_e
+              if duration - cur >= 0.9:
+                  speech.append((max(0.0, cur - 0.25), duration))
+              return speech
+
+          # 3. Dead-Air / Silence Trimmer (0.8s-ൽ കൂടുതലുള്ള നിശ്ശബ്ദത ഒഴിവാക്കുന്നു)
           def remove_dead_air(video_path, base_intervals):
               res = subprocess.run([
                   'ffmpeg', '-i', video_path, '-af', 'silencedetect=noise=-32dB:d=0.8',
@@ -204,7 +235,7 @@ jobs:
           W, H = (1080, 1920) if infos[0][1] > infos[0][0] else (1920, 1080)
           parts, idx_p = [], 0
 
-          # 3. Auto-Exposure & White Balance + Color Grade
+          # 4. Auto-Exposure & White Balance + Color Grade
           auto_wb_exp = "normalize=independence=0:strength=0.30:smoothing=15"
           presets = {
               "cinematic": f"{auto_wb_exp},colorbalance=rs=-0.03:gs=0.02:bs=0.04:rh=0.04:gh=0.02:bh=-0.03,eq=contrast=1.07:saturation=1.15",
@@ -221,7 +252,7 @@ jobs:
               print(f"🎨 Auto-Exposure & White Balance + Preset: {COLOR_GRADE}")
               color_filter = default_color
 
-          # 4. Audio Engine: 100% Normal Voice + 35% Ambient Sound
+          # 5. Audio Engine: 100% Normal Voice + 35% Ambient Sound
           def run_encode(c, st, cd, vf_str, has_audio, smart_audio, out_path):
               if os.path.exists(out_path):
                   os.remove(out_path)
@@ -255,20 +286,30 @@ jobs:
                   segs = [(0.0, d)]
               else:
                   face_segs = get_face_intervals(c, d)
+                  speech_segs = get_speech_intervals(c, d) if (not face_segs and has_audio) else []
+
                   if face_segs:
                       if TRIM_SILENCE == "on" and has_audio:
                           face_segs = remove_dead_air(c, face_segs)
-                      print(f"🧑 [{cname}] {d:.1f}s -> മുഖം കാണുന്ന {len(face_segs)} ഭാഗങ്ങൾ (Dead-Air Trimmed)")
-                      segs = [(s, min(18.0, e - s)) for s, e in face_segs if (e - s) >= 0.8]
+                      print(f"🧑 [{cname}] {d:.1f}s -> മുഖം കാണുന്ന {len(face_segs)} ഭാഗങ്ങൾ പരിധിയില്ലാതെ സംരക്ഷിക്കുന്നു")
+                      segs = [(s, e - s) for s, e in face_segs if (e - s) >= 0.8]
+                  elif speech_segs:
+                      if TRIM_SILENCE == "off":
+                          speech_segs = [(0.0, d)]
+                      print(f"🎙️ [{cname}] {d:.1f}s -> പിന്നണിയിൽ സംസാരിക്കുന്ന {len(speech_segs)} ഭാഗങ്ങൾ പരിധിയില്ലാതെ സംരക്ഷിക്കുന്നു")
+                      segs = [(s, e - s) for s, e in speech_segs if (e - s) >= 0.8]
                   else:
                       trim_start = 0.5
                       usable_d = max(2.0, d - 1.0)
-                      alloc = max(2.8, (d / total) * TARGET_SECONDS)
-                      seg_len = 2.8
-                      n_seg = max(1, int(alloc // seg_len))
-                      step = (usable_d - seg_len) / max(1, n_seg - 1) if n_seg > 1 else 0
-                      segs = [(trim_start + (k * step), seg_len) for k in range(n_seg)]
-                      print(f"🏞️ [{cname}] {d:.1f}s -> B-Roll {len(segs)} കട്ടുകൾ എടുക്കുന്നു")
+                      seg_len = 4.5
+                      alloc = max(seg_len, (d / total) * TARGET_SECONDS)
+                      if usable_d <= seg_len:
+                          segs = [(trim_start, usable_d)]
+                      else:
+                          n_seg = max(1, int(alloc // seg_len))
+                          step = (usable_d - seg_len) / max(1, n_seg - 1) if n_seg > 1 else 0
+                          segs = [(trim_start + (k * step), seg_len) for k in range(n_seg)]
+                      print(f"🏞️ [{cname}] {d:.1f}s -> സംസാരമില്ലാത്ത B-Roll 4.5s വീതമുള്ള {len(segs)} കട്ടുകൾ എടുക്കുന്നു")
 
               for st, cd in segs:
                   trf, out = f"work/t_{idx_p}.trf", f"work/p_{idx_p:04d}.mp4"
