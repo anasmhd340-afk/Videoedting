@@ -1,45 +1,92 @@
-name: Auto Edit Munnar Vlog
-on: [workflow_dispatch]
+name: Pro Cloud Video Editor
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_link:
+        description: 'Google Drive Folder Link'
+        required: true
+        type: string
+      video_title:
+        description: 'Output Video Name (Example: Munnar_Trip)'
+        required: true
+        default: 'Edited_Vlog'
+        type: string
+      target_seconds:
+        description: 'Target Duration in Seconds (0 = Keep all clips full)'
+        required: true
+        default: '180'
+        type: string
+      trim_silence:
+        description: 'Dead-Air / Silence Trimmer (Auto Jump-Cut on Talking Clips)'
+        required: true
+        default: 'on'
+        type: choice
+        options:
+          - 'on'
+          - 'off'
+      color_grade:
+        description: 'Color Style (Auto-uses .cube LUT if present in folder)'
+        required: true
+        default: 'cinematic'
+        type: choice
+        options:
+          - cinematic
+          - natural
+          - vibrant
+          - none
 
 jobs:
   edit-video:
     runs-on: ubuntu-latest
     steps:
-      - name: Install FFmpeg and gdown
+      - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          pip install -q gdown requests
+          pip install -q gdown requests opencv-python-headless
 
-      - name: Download, Edit & Upload Vlog
+      - name: Run Pro Cloud Video Editor
         env:
+          DRIVE_LINK: ${{ github.event.inputs.drive_link }}
+          VIDEO_TITLE: ${{ github.event.inputs.video_title }}
+          TARGET_SECONDS: ${{ github.event.inputs.target_seconds }}
+          TRIM_SILENCE: ${{ github.event.inputs.trim_silence }}
+          COLOR_GRADE: ${{ github.event.inputs.color_grade }}
           GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
           GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
         run: |
           cat << 'EOF' > edit.py
-          import os, re, glob, json, subprocess, shutil, requests
+          import os, re, glob, json, subprocess, shutil, requests, cv2
+          from datetime import datetime, timezone, timedelta
 
-          DRIVE_LINK = "https://drive.google.com/drive/folders/1tUd2HNXpDTPRekMlnOiYqDbcpi6Th-fx"
-          TARGET_SECONDS = 180  # 3 മിനിറ്റ് ഹൈലൈറ്റ് കട്ട്
-          SEG_LEN = 2.2
-          FINAL_FILE = "Final_Munnar_Vlog_3Min.mp4"
+          DRIVE_LINK = os.environ.get("DRIVE_LINK", "").strip()
+          RAW_TITLE = os.environ.get("VIDEO_TITLE", "Edited_Vlog").strip()
+          SAFE_TITLE = re.sub(r'[^a-zA-Z0-9_-]', '_', RAW_TITLE) or "Edited_Vlog"
+          TARGET_SECONDS = int(os.environ.get("TARGET_SECONDS", "180") or "180")
+          TRIM_SILENCE = os.environ.get("TRIM_SILENCE", "on").strip()
+          COLOR_GRADE = os.environ.get("COLOR_GRADE", "cinematic").strip()
+
+          ist = timezone(timedelta(hours=5, minutes=30))
+          timestamp = datetime.now(ist).strftime("%Y%m%d_%H%M")
+          FINAL_FILE = f"{SAFE_TITLE}_{timestamp}.mp4"
 
           os.makedirs("raw", exist_ok=True)
           os.makedirs("work", exist_ok=True)
 
-          print("📥 Google Drive-ൽ നിന്ന് ഫയലുകൾ ഡൗൺലോഡ് ചെയ്യുന്നു...")
+          print(f"📥 Google Drive-ൽ നിന്ന് ഫയലുകൾ ഡൗൺലോഡ് ചെയ്യുന്നു ({SAFE_TITLE})...")
           os.system(f'gdown --folder "{DRIVE_LINK}" -O raw --continue')
 
           clips = sorted([
               c for c in glob.glob("raw/**/*.*", recursive=True)
-              if c.lower().endswith(('.mp4', '.mov', '.mkv')) and "Final_" not in c
+              if c.lower().endswith(('.mp4', '.mov', '.mkv')) and not os.path.basename(c).startswith(SAFE_TITLE)
           ])
           bgm = glob.glob("raw/**/bgm.mp3", recursive=True)
           lut_files = glob.glob("raw/**/*.cube", recursive=True)
 
           if not clips:
-              raise FileNotFoundError("No videos downloaded! Check Drive folder link and permissions.")
+              raise FileNotFoundError("No videos downloaded! Check Drive folder link and 'Anyone with the link' permission.")
 
           def get_info(p):
               out = subprocess.check_output([
@@ -54,59 +101,162 @@ jobs:
               ]).decode().strip()
               return int(out[0]), int(out[1]), float(out[2]), bool(aud)
 
+          # 1. Face-Aware Detection (OpenCV)
+          face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+          def get_face_intervals(video_path, duration):
+              cap = cv2.VideoCapture(video_path)
+              fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+              step_frames = max(1, int(fps * 0.5))
+              face_times = []
+              frame_idx = 0
+
+              while True:
+                  ret, frame = cap.read()
+                  if not ret:
+                      break
+                  if frame_idx % step_frames == 0:
+                      small = cv2.resize(frame, (320, 180))
+                      gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                      faces = face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20))
+                      if len(faces) > 0:
+                          face_times.append(frame_idx / fps)
+                  frame_idx += 1
+              cap.release()
+
+              if not face_times:
+                  return []
+
+              intervals = []
+              start_t = max(0.0, face_times[0] - 0.5)
+              prev_t = face_times[0]
+              for t in face_times[1:]:
+                  if t - prev_t <= 1.5:
+                      prev_t = t
+                  else:
+                      intervals.append((start_t, min(duration, prev_t + 0.6)))
+                      start_t = max(0.0, t - 0.5)
+                      prev_t = t
+              intervals.append((start_t, min(duration, prev_t + 0.6)))
+              return [(s, e) for s, e in intervals if (e - s) >= 1.2]
+
+          # 2. Dead-Air / Silence Trimmer (0.8s-ൽ കൂടുതലുള്ള നിശ്ശബ്ദത ഒഴിവാക്കുന്നു)
+          def remove_dead_air(video_path, base_intervals):
+              res = subprocess.run([
+                  'ffmpeg', '-i', video_path, '-af', 'silencedetect=noise=-32dB:d=0.8',
+                  '-f', 'null', '-'
+              ], capture_output=True, text=True)
+              silences = []
+              cur_start = None
+              for line in res.stderr.splitlines():
+                  if 'silence_start:' in line:
+                      m = re.search(r'silence_start:\s*([0-9.]+)', line)
+                      if m:
+                          cur_start = float(m.group(1))
+                  elif 'silence_end:' in line and cur_start is not None:
+                      m = re.search(r'silence_end:\s*([0-9.]+)', line)
+                      if m:
+                          silences.append((cur_start, float(m.group(1))))
+                          cur_start = None
+              if cur_start is not None:
+                  silences.append((cur_start, 99999.0))
+
+              if not silences:
+                  return base_intervals
+
+              refined = []
+              pad = 0.22  # വാക്കുകൾ മുറിയാതിരിക്കാൻ 0.22s മാർജിൻ
+              for s, e in base_intervals:
+                  cur = s
+                  for sil_s, sil_e in silences:
+                      if sil_e <= cur or sil_s >= e:
+                          continue
+                      cut_end = min(e, sil_s + pad)
+                      if cut_end - cur >= 0.8:
+                          refined.append((cur, cut_end))
+                      cur = max(cur, sil_e - pad)
+                  if e - cur >= 0.8:
+                      refined.append((cur, e))
+              return refined if refined else base_intervals
+
           infos = [get_info(c) for c in clips]
           durs = [x[2] for x in infos]
           total = sum(durs)
           W, H = (1080, 1920) if infos[0][1] > infos[0][0] else (1920, 1080)
           parts, idx_p = [], 0
 
-          # Built-in Munnar Cinematic Color Grade
-          default_color = "colorbalance=rs=-0.03:gs=0.02:bs=0.04:rh=0.04:gh=0.02:bh=-0.03,eq=contrast=1.08:saturation=1.18:brightness=0.01"
+          # 3. Auto-Exposure & White Balance + Color Grade
+          auto_wb_exp = "normalize=independence=0:strength=0.30:smoothing=15"
+          presets = {
+              "cinematic": f"{auto_wb_exp},colorbalance=rs=-0.03:gs=0.02:bs=0.04:rh=0.04:gh=0.02:bh=-0.03,eq=contrast=1.07:saturation=1.15",
+              "natural": f"{auto_wb_exp},eq=contrast=1.03:saturation=1.05",
+              "vibrant": f"{auto_wb_exp},eq=contrast=1.09:saturation=1.26",
+              "none": auto_wb_exp
+          }
+          default_color = presets.get(COLOR_GRADE, presets["cinematic"])
+
           if lut_files:
-              print(f"🎨 Custom LUT കണ്ടെത്തി: {os.path.basename(lut_files[0])}")
-              color_filter = f"lut3d=file='{lut_files[0]}':interp=trilinear,eq=contrast=1.05:saturation=1.12"
+              print(f"🎨 Auto-Exposure + Custom LUT: {os.path.basename(lut_files[0])}")
+              color_filter = f"{auto_wb_exp},lut3d=file='{lut_files[0]}':interp=trilinear,eq=contrast=1.04:saturation=1.08"
           else:
-              print("🎨 Built-in Munnar Cinematic Color Grade ഉപയോഗിക്കുന്നു...")
+              print(f"🎨 Auto-Exposure & White Balance + Preset: {COLOR_GRADE}")
               color_filter = default_color
 
-          def run_encode(c, st, cd, vf_str, has_audio, use_afftdn, out_path):
+          # 4. Audio Engine: 100% Normal Voice + 35% Ambient Sound
+          def run_encode(c, st, cd, vf_str, has_audio, smart_audio, out_path):
               if os.path.exists(out_path):
                   os.remove(out_path)
               if has_audio:
-                  af_str = "highpass=f=180,afftdn=nf=-25,volume=0.55" if use_afftdn else "highpass=f=180,volume=0.55"
+                  if smart_audio:
+                      # സംസാരം 100% Normal ആയി നിലനിർത്തുകയും, അന്തരീക്ഷ ശബ്ദം 35% (-9dB) ആയി കുറയ്ക്കുകയും ചെയ്യുന്നു
+                      af_str = "highpass=f=160,compand=attacks=0.05:decays=0.35:points=-70/-79|-35/-44|-24/-24|0/-1:soft-knee=6,loudnorm=I=-16:TP=-1.5:LRA=11"
+                  else:
+                      af_str = "highpass=f=160,volume=0.85"
                   cmd = [
                       'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
                       '-vf', vf_str, '-af', af_str, '-r', '30',
-                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '26', '-pix_fmt', 'yuv420p',
-                      '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out_path
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '25', '-pix_fmt', 'yuv420p',
+                      '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '112k', '-shortest', out_path
                   ]
               else:
                   cmd = [
                       'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
                       '-f', 'lavfi', '-t', str(cd), '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
                       '-vf', vf_str, '-map', '0:v:0', '-map', '1:a:0', '-r', '30',
-                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '26', '-pix_fmt', 'yuv420p',
-                      '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '96k', '-shortest', out_path
+                      '-c:v', 'libx264', '-preset', 'fast', '-crf', '25', '-pix_fmt', 'yuv420p',
+                      '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '112k', '-shortest', out_path
                   ]
               return subprocess.run(cmd, capture_output=True, text=True)
 
           for i, (c, info) in enumerate(zip(clips, infos)):
               _, _, d, has_audio = info
-              trim_start = 0.6 if d > 4.0 else 0.0
-              usable_d = max(1.5, d - (trim_start * 2))
-              alloc = max(2.2, (d / total) * TARGET_SECONDS)
+              cname = os.path.basename(c)
 
-              if usable_d <= alloc or usable_d <= 3.0:
-                  segs = [(trim_start, usable_d)]
+              # 7 സെക്കൻഡോ അതിൽ താഴെയോ ആണെങ്കിൽ കട്ട് ചെയ്യാതെ പൂർണ്ണമായി എടുക്കുന്നു
+              if d <= 7.0 or TARGET_SECONDS == 0:
+                  print(f"🎬 [{cname}] {d:.1f}s -> കട്ട് ചെയ്യാതെ പൂർണ്ണമായി എടുക്കുന്നു")
+                  segs = [(0.0, d)]
               else:
-                  n_seg = max(1, int(alloc // SEG_LEN))
-                  step = (usable_d - SEG_LEN) / max(1, n_seg - 1) if n_seg > 1 else 0
-                  segs = [(trim_start + (k * step), SEG_LEN) for k in range(n_seg)]
+                  face_segs = get_face_intervals(c, d)
+                  if face_segs:
+                      if TRIM_SILENCE == "on" and has_audio:
+                          face_segs = remove_dead_air(c, face_segs)
+                      print(f"🧑 [{cname}] {d:.1f}s -> മുഖം കാണുന്ന {len(face_segs)} ഭാഗങ്ങൾ (Dead-Air Trimmed)")
+                      segs = [(s, min(18.0, e - s)) for s, e in face_segs if (e - s) >= 0.8]
+                  else:
+                      trim_start = 0.5
+                      usable_d = max(2.0, d - 1.0)
+                      alloc = max(2.8, (d / total) * TARGET_SECONDS)
+                      seg_len = 2.8
+                      n_seg = max(1, int(alloc // seg_len))
+                      step = (usable_d - seg_len) / max(1, n_seg - 1) if n_seg > 1 else 0
+                      segs = [(trim_start + (k * step), seg_len) for k in range(n_seg)]
+                      print(f"🏞️ [{cname}] {d:.1f}s -> B-Roll {len(segs)} കട്ടുകൾ എടുക്കുന്നു")
 
               for st, cd in segs:
                   trf, out = f"work/t_{idx_p}.trf", f"work/p_{idx_p:04d}.mp4"
                   sp = f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-                  
+
                   det = subprocess.run([
                       'ffmpeg', '-y', '-ss', str(st), '-t', str(cd), '-i', c,
                       '-vf', f'{sp},vidstabdetect=shakiness=5:accuracy=8:result={trf}',
@@ -120,10 +270,8 @@ jobs:
 
                   res = run_encode(c, st, cd, vf_primary, has_audio, True, out)
 
-                  # ആദ്യ ശ്രമം പരാജയപ്പെട്ടാൽ Safe Fallback ഫിൽട്ടർ ഉപയോഗിച്ച് വീണ്ടും ശ്രമിക്കുന്നു
                   if res.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
-                      print(f"⚠️ Segment {idx_p} primary failed, trying fallback...")
-                      vf_safe = f"{sp},{default_color}"
+                      vf_safe = f"{sp},eq=contrast=1.05:saturation=1.10"
                       res = run_encode(c, st, cd, vf_safe, has_audio, False, out)
 
                   if res.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1024:
@@ -132,12 +280,12 @@ jobs:
                   else:
                       if os.path.exists(out):
                           os.remove(out)
-                      print(f"❌ Segment {idx_p} skipped. Error:", res.stderr[-400:])
+                      print(f"⚠️ Segment {idx_p} skipped.")
 
           if not parts:
-              raise RuntimeError("No valid video segments were rendered! Check FFmpeg logs above.")
+              raise RuntimeError("No valid video segments were rendered!")
 
-          print(f"✅ ആകെ {len(parts)} കട്ടുകൾ വിജയകരമായി തയ്യാറായി. കൂട്ടിച്ചേർക്കുന്നു...")
+          print(f"✅ ആകെ {len(parts)} കട്ടുകൾ കൂട്ടിച്ചേർക്കുന്നു...")
           with open("work/list.txt", "w") as f:
               for p in parts:
                   f.write(f"file '{os.path.abspath(p)}'\n")
@@ -149,16 +297,26 @@ jobs:
           if merge_res.returncode != 0:
               raise RuntimeError(f"Merge failed: {merge_res.stderr}")
 
+          # Smart BGM Ducking (സംസാരിക്കുമ്പോൾ BGM തനിയെ താഴുന്നു)
           if bgm:
-              subprocess.run([
+              print("🎵 Smart Audio Ducking ഉപയോഗിച്ച് BGM ചേർക്കുന്നു...")
+              duck_filter = (
+                  "[1:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=0.25[bg];"
+                  "[0:a]asplit=2[orig][sc];"
+                  "[bg][sc]sidechaincompress=threshold=0.035:ratio=6:attack=150:release=800[bg_ducked];"
+                  "[orig][bg_ducked]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+              )
+              bgm_res = subprocess.run([
                   'ffmpeg', '-y', '-i', 'work/merged.mp4', '-stream_loop', '-1', '-i', bgm[0],
-                  '-filter_complex', '[0:a]volume=1.0[orig];[1:a]volume=0.15[b];[orig][b]amix=inputs=2:duration=first:dropout_transition=2[aout]',
+                  '-filter_complex', duck_filter,
                   '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest', FINAL_FILE
-              ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              ], capture_output=True, text=True)
+              if bgm_res.returncode != 0:
+                  shutil.move('work/merged.mp4', FINAL_FILE)
           else:
               shutil.move('work/merged.mp4', FINAL_FILE)
 
-          # Google Drive-ലേക്ക് നേരിട്ട് അപ്‌ലോഡ് ചെയ്യുന്നു
+          # Google Drive Upload
           cid = os.environ.get("GDRIVE_CLIENT_ID")
           csec = os.environ.get("GDRIVE_CLIENT_SECRET")
           rtok = os.environ.get("GDRIVE_REFRESH_TOKEN")
@@ -167,7 +325,7 @@ jobs:
           if not (cid and csec and rtok and m):
               raise RuntimeError("Google Drive Secrets അല്ലെങ്കിൽ Folder Link കൃത്യമല്ല!")
 
-          print("☁️ Google Drive-ലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...")
+          print(f"☁️ '{FINAL_FILE}' Google Drive-ലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...")
           folder_id = m.group(1)
           tok_res = requests.post("https://oauth2.googleapis.com/token", data={
               "client_id": cid, "client_secret": csec,
@@ -187,7 +345,7 @@ jobs:
           with open(FINAL_FILE, "rb") as vf_data:
               up = requests.put(upload_url, data=vf_data)
           if up.status_code in (200, 201):
-              print("🎉 വീഡിയോ വിജയകരമായി Google Drive-ലെ RawVlog ഫോൾഡറിൽ സേവ് ആയി!")
+              print(f"🎉 '{FINAL_FILE}' വിജയകരമായി Google Drive ഫോൾഡറിൽ സേവ് ആയി!")
           else:
               raise RuntimeError(f"Drive upload failed: {up.status_code} {up.text}")
           EOF
