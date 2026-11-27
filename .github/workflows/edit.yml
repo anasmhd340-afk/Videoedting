@@ -109,7 +109,7 @@ jobs:
               ]).decode().strip()
               return int(out[0]), int(out[1]), float(out[2]), bool(aud)
 
-          # 1. Safe Face-Aware Detection (OpenCV)
+          # 1. Stricter Face-Aware Detection (OpenCV)
           face_cascade = None
           if cv2 is not None:
               try:
@@ -138,13 +138,13 @@ jobs:
                       if frame_idx % step_frames == 0:
                           small = cv2.resize(frame, (320, 180))
                           gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                          faces = face_cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=4, minSize=(20, 20))
+                          faces = face_cascade.detectMultiScale(gray, scaleFactor=1.18, minNeighbors=6, minSize=(28, 28))
                           if len(faces) > 0:
                               face_times.append(frame_idx / fps)
                       frame_idx += 1
                   cap.release()
 
-                  if not face_times:
+                  if len(face_times) < 2:
                       return []
 
                   intervals = []
@@ -158,15 +158,15 @@ jobs:
                           start_t = max(0.0, t - 0.5)
                           prev_t = t
                   intervals.append((start_t, min(duration, prev_t + 0.6)))
-                  return [(s, e) for s, e in intervals if (e - s) >= 1.2]
+                  return [(s, e) for s, e in intervals if (e - s) >= 1.5]
               except Exception:
                   return []
 
-          # 2. Human Vocal-Band Speech Detection (കാറ്റും വണ്ടിയുടെ ശബ്ദവും ഒഴിവാക്കി സംസാരം മാത്രം തിരിച്ചറിയുന്നു)
+          # 2. Wind-Filtered Speech Detection (കാറ്റിന്റെ ശബ്ദം ഒഴിവാക്കി സംസാരം മാത്രം തിരിച്ചറിയുന്നു)
           def get_speech_intervals(video_path, duration):
               res = subprocess.run([
                   'ffmpeg', '-i', video_path,
-                  '-af', 'highpass=f=300,lowpass=f=3000,silencedetect=noise=-22dB:d=0.6',
+                  '-af', 'highpass=f=350,lowpass=f=2800,afftdn=nf=-20,silencedetect=noise=-16dB:d=0.45',
                   '-f', 'null', '-'
               ], capture_output=True, text=True)
               silences = []
@@ -184,13 +184,19 @@ jobs:
               if cur_start is not None:
                   silences.append((cur_start, duration))
 
+              # നിശ്ശബ്ദത ഒട്ടും ഇല്ലാത്ത തുടർച്ചയായ ശബ്ദം (15s+) കാറ്റ്/വാഹന ശബ്ദമാണ്, സംസാരമല്ല
+              if not silences and duration > 12.0:
+                  return []
+
               speech = []
               cur = 0.0
               for sil_s, sil_e in silences:
-                  if sil_s - cur >= 1.2:
+                  seg_dur = sil_s - cur
+                  if 1.0 <= seg_dur <= 15.0:
                       speech.append((max(0.0, cur - 0.20), min(duration, sil_s + 0.20)))
                   cur = sil_e
-              if duration - cur >= 1.2:
+              end_dur = duration - cur
+              if 1.0 <= end_dur <= 15.0:
                   speech.append((max(0.0, cur - 0.20), duration))
               return speech
 
@@ -198,7 +204,7 @@ jobs:
           def remove_dead_air(video_path, base_intervals):
               res = subprocess.run([
                   'ffmpeg', '-i', video_path,
-                  '-af', 'highpass=f=250,lowpass=f=3200,silencedetect=noise=-28dB:d=0.8',
+                  '-af', 'highpass=f=300,lowpass=f=3000,afftdn=nf=-20,silencedetect=noise=-20dB:d=0.7',
                   '-f', 'null', '-'
               ], capture_output=True, text=True)
               silences = []
@@ -268,11 +274,11 @@ jobs:
                       broll_total_dur += d
                       clip_plans.append((c, info, "broll", []))
 
-          # Strict B-Roll Budget Calculation (Target സമയം മറികടക്കാതെ നിയന്ത്രിക്കുന്നു)
+          # Strict B-Roll Budget Calculation
           SEG_LEN = 2.5
           remaining_budget = max(0.0, TARGET_SECONDS - protected_dur)
           broll_ratio = min(1.0, remaining_budget / broll_total_dur) if broll_total_dur > 0 else 0.0
-          print(f"⏱️ Target: {TARGET_SECONDS}s | Protected: {protected_dur:.1f}s | B-Roll Budget: {remaining_budget:.1f}s ({broll_ratio*100:.0f}%)")
+          print(f"⏱️ Target: {TARGET_SECONDS}s | Protected: {protected_dur:.1f}s | B-Roll Total: {broll_total_dur:.1f}s | B-Roll Budget: {remaining_budget:.1f}s ({broll_ratio*100:.0f}%)")
 
           # 5. Auto-Exposure & White Balance + Color Grade
           auto_wb_exp = "normalize=independence=0:strength=0.30:smoothing=15"
