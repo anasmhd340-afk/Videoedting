@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,17 @@ TEMP_DIR = Path("temp_video")
 DEFAULT_MALAYALAM_VOICE = "ml-IN-MidhunNeural"
 
 
+def ensure_ffmpeg_tools():
+    """Ensure both ffmpeg and ffprobe are available on PATH."""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+    print("Installing static-ffmpeg for ffmpeg/ffprobe support...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "static-ffmpeg"])
+    import static_ffmpeg
+
+    static_ffmpeg.add_paths(weak=True)
+
+
 def ensure_edge_tts():
     try:
         import edge_tts  # noqa: F401
@@ -31,19 +43,29 @@ def ensure_edge_tts():
 
 
 def get_media_duration(file_path: Path) -> float:
-    """Return exact duration in seconds using ffprobe."""
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(file_path),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return float(res.stdout.strip())
+    """Return exact duration in seconds using ffprobe (with ffmpeg stderr fallback)."""
+    ensure_ffmpeg_tools()
+    if shutil.which("ffprobe"):
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(res.stdout.strip())
+
+    # Fallback via ffmpeg -i output
+    res = subprocess.run(["ffmpeg", "-i", str(file_path)], capture_output=True, text=True)
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr)
+    if not match:
+        raise RuntimeError(f"Could not determine media duration for {file_path.name}")
+    hours, mins, secs = map(float, match.groups())
+    return hours * 3600 + mins * 60 + secs
 
 
 def get_drive_service():
@@ -365,6 +387,7 @@ def build_time_synced_mp3(
     output_mp3: Path,
     voice: str,
 ) -> bool:
+    ensure_ffmpeg_tools()
     segments = parse_timed_segments(script_txt, srt_txt, video_duration)
     if not segments:
         print("Warning: No timed narration segments found for synced TTS audio.", flush=True)
