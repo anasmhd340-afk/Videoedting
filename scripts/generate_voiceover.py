@@ -30,6 +30,22 @@ def ensure_edge_tts():
         return edge_tts
 
 
+def get_media_duration(file_path: Path) -> float:
+    """Return exact duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(file_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return float(res.stdout.strip())
+
+
 def get_drive_service():
     client_id = os.environ.get("GDRIVE_CLIENT_ID", "").strip()
     client_secret = os.environ.get("GDRIVE_CLIENT_SECRET", "").strip()
@@ -190,7 +206,15 @@ def generate_with_retry(client, uploaded_file, prompt: str, max_attempts: int = 
     raise last_error
 
 
-def generate_malayalam_script(video_path: Path, style: str, extra_notes: str) -> tuple[str, str]:
+def format_mm_ss(seconds: float) -> str:
+    total = int(round(seconds))
+    mins, secs = divmod(total, 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
+def generate_malayalam_script(
+    video_path: Path, video_duration: float, style: str, extra_notes: str
+) -> tuple[str, str]:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY secret is not set in GitHub repository secrets.")
@@ -209,21 +233,22 @@ def generate_malayalam_script(video_path: Path, style: str, extra_notes: str) ->
             raise RuntimeError(f"Gemini file processing failed with state: {uploaded_file.state.name}")
 
         extra_section = f"\nAdditional creator notes/context: {extra_notes}" if extra_notes else ""
+        dur_str = format_mm_ss(video_duration)
 
-        prompt = f"""Watch this entire video and write a concise, engaging Malayalam voiceover script that highlights all key moments, locations, and transitions without narrating every single second or minor camera cut.
+        prompt = f"""Watch this entire video (total duration: {dur_str}, i.e. {video_duration:.1f} seconds) and write a concise, engaging Malayalam voiceover script that highlights all key moments, locations, and transitions without narrating every single second or minor camera cut.
 
 Style requested: {style}{extra_section}
 
 Strict Output Requirements:
 1. Provide TWO clearly separated sections using the exact markers `===SCRIPT_TXT===` and `===SUBTITLES_SRT===`.
 2. Under `===SCRIPT_TXT===`:
-   - Group related shots into broader, natural story segments (e.g., 15–45 second chapters/beats) instead of second-by-second commentary.
+   - Group related shots into natural story segments with intentional silent pauses between segments wherever the visuals or ambient sounds should breathe without voiceover (for example, leaving a 4–10 second gap with no entry when nothing needs to be spoken).
    - Start with a crisp, warm, conversational Malayalam hook suited to the opening mood.
-   - Use `[MM:SS - MM:SS]` timestamps for each major segment, preceded by a short one-line Malayalam scene tag `(ദൃശ്യം: ...)`.
-   - Keep each narration block short, punchy, and natural (1–3 crisp sentences per segment)—capture every important highlight, shift in scenery, or key moment without over-describing what is already obvious on screen.
-   - Use natural, contemporary, spoken-friendly Malayalam—avoid stiff or bookish Sanskritized phrasing, and leave generous breathing pauses so the visuals shine.
+   - Use `[MM:SS - MM:SS]` timestamps for each spoken segment (never exceeding `{dur_str}`), preceded by a short one-line Malayalam scene tag `(ദൃശ്യം: ...)`.
+   - Keep each narration block concise enough (1–2 crisp sentences, roughly 2–2.5 words per second of that segment's window) so it can be spoken comfortably within its `[MM:SS - MM:SS]` timeframe without rushing.
+   - Use natural, contemporary, spoken-friendly Malayalam—avoid stiff or bookish Sanskritized phrasing.
 3. Under `===SUBTITLES_SRT===`:
-   - Output valid `.srt` subtitle blocks (`00:MM:SS,000 --> 00:MM:SS,000`) matching those concise narration blocks with clean Malayalam lines only.
+   - Output valid `.srt` subtitle blocks (`00:MM:SS,000 --> 00:MM:SS,000`) matching the exact start and end timestamps of those spoken segments (leaving gaps where there is no voiceover) with clean Malayalam lines only.
 """
 
         raw_text = generate_with_retry(client, uploaded_file, prompt)
@@ -245,49 +270,204 @@ Strict Output Requirements:
     return script_txt, srt_txt
 
 
-def extract_spoken_narration(script_txt: str, srt_txt: str) -> str:
-    """Extract clean spoken Malayalam sentences without timestamps, SRT indices, or visual cues."""
+def _srt_time_to_seconds(ts: str) -> float:
+    match = re.match(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})", ts.strip())
+    if not match:
+        return 0.0
+    h, m, s, ms = map(int, match.groups())
+    return h * 3600 + m * 60 + s + ms / 1000.0
+
+
+def _mmss_to_seconds(ts: str) -> float:
+    parts = [int(p) for p in ts.strip().split(":")]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return float(parts[0])
+
+
+def parse_timed_segments(script_txt: str, srt_txt: str, max_duration: float) -> list[dict]:
+    """Parse timed narration segments (start, end, text) from SRT or TXT."""
+    segments: list[dict] = []
+
     if srt_txt:
-        lines = []
-        for raw_line in srt_txt.splitlines():
-            line = raw_line.strip()
-            if not line or line.isdigit() or "-->" in line:
+        blocks = re.split(r"\n\s*\n", srt_txt.strip())
+        for block in blocks:
+            lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+            time_line_idx = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+            if time_line_idx is None:
                 continue
-            lines.append(line)
-        cleaned = " ".join(lines).strip()
-        if cleaned:
-            return cleaned
+            start_str, end_str = lines[time_line_idx].split("-->", 1)
+            start_sec = max(0.0, _srt_time_to_seconds(start_str))
+            end_sec = min(max_duration, _srt_time_to_seconds(end_str))
+            text = " ".join(lines[time_line_idx + 1 :]).strip()
+            if text and start_sec < max_duration:
+                segments.append({"start": start_sec, "end": max(end_sec, start_sec + 1.0), "text": text})
 
-    lines = []
-    for raw_line in script_txt.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if re.match(r"^\[?\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\]?$", line):
-            continue
-        if line.startswith("(ദൃശ്യം:") or line.startswith("**"):
-            continue
-        line = re.sub(r"^\[?\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\]?\s*", "", line)
-        line = re.sub(r"\(ദൃശ്യം:.*?\)", "", line).strip()
-        if line:
-            lines.append(line)
-    return " ".join(lines).strip()
+    if not segments:
+        current_start = None
+        current_end = None
+        current_lines: list[str] = []
+        ts_pattern = re.compile(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)\]?")
+
+        for raw_line in script_txt.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("(ദൃശ്യം:") or line.startswith("**"):
+                continue
+            m = ts_pattern.match(line)
+            if m:
+                if current_start is not None and current_lines:
+                    segments.append(
+                        {
+                            "start": current_start,
+                            "end": min(max_duration, current_end),
+                            "text": " ".join(current_lines).strip(),
+                        }
+                    )
+                current_start = max(0.0, _mmss_to_seconds(m.group(1)))
+                current_end = _mmss_to_seconds(m.group(2))
+                remainder = ts_pattern.sub("", line).strip()
+                current_lines = [remainder] if remainder else []
+            elif current_start is not None:
+                clean_line = re.sub(r"\(ദൃശ്യം:.*?\)", "", line).strip()
+                if clean_line:
+                    current_lines.append(clean_line)
+
+        if current_start is not None and current_lines:
+            segments.append(
+                {
+                    "start": current_start,
+                    "end": min(max_duration, current_end),
+                    "text": " ".join(current_lines).strip(),
+                }
+            )
+
+    segments.sort(key=lambda s: s["start"])
+    return segments
 
 
-async def _synthesize_tts(text: str, voice: str, output_mp3: Path):
+async def _synthesize_all_segments(segments: list[dict], voice: str, work_dir: Path) -> list[Path]:
     edge_tts = ensure_edge_tts()
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(str(output_mp3))
+    clip_paths: list[Path] = []
+    for idx, seg in enumerate(segments):
+        raw_clip = work_dir / f"seg_{idx:03d}_raw.mp3"
+        communicate = edge_tts.Communicate(text=seg["text"], voice=voice)
+        await communicate.save(str(raw_clip))
+        clip_paths.append(raw_clip)
+    return clip_paths
 
 
-def generate_voiceover_audio(script_txt: str, srt_txt: str, output_mp3: Path, voice: str) -> bool:
-    spoken_text = extract_spoken_narration(script_txt, srt_txt)
-    if not spoken_text:
-        print("Warning: No spoken narration text extracted for TTS audio.", flush=True)
+def build_time_synced_mp3(
+    script_txt: str,
+    srt_txt: str,
+    video_duration: float,
+    output_mp3: Path,
+    voice: str,
+) -> bool:
+    segments = parse_timed_segments(script_txt, srt_txt, video_duration)
+    if not segments:
+        print("Warning: No timed narration segments found for synced TTS audio.", flush=True)
         return False
 
-    print(f"Generating Malayalam MP3 audio with Edge-TTS ({voice})...", flush=True)
-    asyncio.run(_synthesize_tts(spoken_text, voice, output_mp3))
+    print(
+        f"Synthesizing {len(segments)} timed Malayalam voiceover segments ({voice}) to match {video_duration:.2f}s video...",
+        flush=True,
+    )
+    seg_dir = TEMP_DIR / "tts_segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_clips = asyncio.run(_synthesize_all_segments(segments, voice, seg_dir))
+
+    placed_clips: list[tuple[int, Path]] = []
+    try:
+        for idx, (seg, raw_clip) in enumerate(zip(segments, raw_clips)):
+            if not raw_clip.exists() or raw_clip.stat().st_size == 0:
+                continue
+
+            next_start = segments[idx + 1]["start"] if idx + 1 < len(segments) else video_duration
+            max_allowed = max(0.8, min(next_start - seg["start"] - 0.15, video_duration - seg["start"]))
+            if max_allowed <= 0.3:
+                continue
+
+            actual_dur = get_media_duration(raw_clip)
+            final_clip = raw_clip
+
+            # Gently speed up only if spoken audio would spill over into the next segment's timestamp
+            if actual_dur > max_allowed:
+                speed = min(1.35, actual_dur / max_allowed)
+                fitted_clip = seg_dir / f"seg_{idx:03d}_fit.mp3"
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-v",
+                        "error",
+                        "-i",
+                        str(raw_clip),
+                        "-filter:a",
+                        f"atempo={speed:.4f}",
+                        str(fitted_clip),
+                    ],
+                    check=True,
+                )
+                final_clip = fitted_clip
+
+            delay_ms = int(round(seg["start"] * 1000))
+            placed_clips.append((delay_ms, final_clip))
+
+        if not placed_clips:
+            return False
+
+        # Build silent base track of exact video duration + place each segment at its exact timestamp
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"anullsrc=r=24000:cl=mono:d={video_duration:.3f}",
+        ]
+        filter_parts = []
+        mix_labels = ["[0:a]"]
+
+        for i, (delay_ms, clip_path) in enumerate(placed_clips, start=1):
+            ffmpeg_cmd.extend(["-i", str(clip_path)])
+            filter_parts.append(f"[{i}:a]aresample=24000,adelay={delay_ms}|{delay_ms}[a{i}]")
+            mix_labels.append(f"[a{i}]")
+
+        filter_complex = (
+            ";".join(filter_parts)
+            + f";{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=first:normalize=0,atrim=0:{video_duration:.3f}[out]"
+        )
+
+        ffmpeg_cmd.extend(
+            [
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[out]",
+                "-c:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                str(output_mp3),
+            ]
+        )
+        subprocess.run(ffmpeg_cmd, check=True)
+    finally:
+        for f in seg_dir.glob("*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        try:
+            seg_dir.rmdir()
+        except Exception:
+            pass
+
     return output_mp3.exists() and output_mp3.stat().st_size > 0
 
 
@@ -316,7 +496,9 @@ def main():
     download_drive_file(drive, video_id, local_video)
 
     try:
-        script_txt, srt_txt = generate_malayalam_script(local_video, style, extra_notes)
+        video_duration = get_media_duration(local_video)
+        print(f"Detected exact video duration: {video_duration:.2f}s ({format_mm_ss(video_duration)})", flush=True)
+        script_txt, srt_txt = generate_malayalam_script(local_video, video_duration, style, extra_notes)
     finally:
         if local_video.exists():
             local_video.unlink()
@@ -335,9 +517,11 @@ def main():
         print(f"Uploaded SRT subtitles to Google Drive: {srt_link}", flush=True)
 
     mp3_path = OUTPUT_DIR / f"{stem}_voiceover.mp3"
-    if generate_voiceover_audio(script_txt, srt_txt, mp3_path, tts_voice):
+    if build_time_synced_mp3(script_txt, srt_txt, video_duration, mp3_path, tts_voice):
+        final_audio_dur = get_media_duration(mp3_path)
+        print(f"Generated time-synced MP3 duration: {final_audio_dur:.2f}s", flush=True)
         mp3_link = upload_to_drive(drive, mp3_path, target_parent, "audio/mpeg")
-        print(f"Uploaded MP3 voiceover audio to Google Drive: {mp3_link}", flush=True)
+        print(f"Uploaded time-synced MP3 voiceover audio to Google Drive: {mp3_link}", flush=True)
 
 
 if __name__ == "__main__":
