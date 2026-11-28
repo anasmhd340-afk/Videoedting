@@ -257,20 +257,21 @@ def generate_malayalam_script(
         extra_section = f"\nAdditional creator notes/context: {extra_notes}" if extra_notes else ""
         dur_str = format_mm_ss(video_duration)
 
-        prompt = f"""Watch this entire video (total duration: {dur_str}, i.e. {video_duration:.1f} seconds) and write a concise, engaging Malayalam voiceover script that highlights all key moments, locations, and transitions without narrating every single second or minor camera cut.
+        prompt = f"""Watch this entire video (total duration: {dur_str}, i.e. {video_duration:.1f} seconds) and write a well-paced, engaging Malayalam voiceover script that covers the whole timeline smoothly with only brief natural pauses between segments.
 
 Style requested: {style}{extra_section}
 
 Strict Output Requirements:
 1. Provide TWO clearly separated sections using the exact markers `===SCRIPT_TXT===` and `===SUBTITLES_SRT===`.
 2. Under `===SCRIPT_TXT===`:
-   - Group related shots into natural story segments with intentional silent pauses between segments wherever the visuals or ambient sounds should breathe without voiceover (for example, leaving a 4–10 second gap with no entry when nothing needs to be spoken).
+   - Cover the entire video from start (`00:00`) to near the end (`{dur_str}`) in steady 8–15 second story segments.
+   - Keep silent gaps between segments **strictly short: ONLY 2 to 4 seconds** (for example, `00:12 - 00:15` silent pause). **NEVER leave long silent gaps of 8–25+ seconds** without voiceover.
    - Start with a crisp, warm, conversational Malayalam hook suited to the opening mood.
    - Use `[MM:SS - MM:SS]` timestamps for each spoken segment (never exceeding `{dur_str}`), preceded by a short one-line Malayalam scene tag `(ദൃശ്യം: ...)`.
-   - Keep each narration block concise enough (1–2 crisp sentences, roughly 2–2.5 words per second of that segment's window) so it can be spoken comfortably within its `[MM:SS - MM:SS]` timeframe without rushing.
+   - Keep each narration block concise and natural (1–2 crisp sentences, roughly 2–2.5 words per second of that segment's window) so it fits comfortably inside its `[MM:SS - MM:SS]` window without rushing.
    - Use natural, contemporary, spoken-friendly Malayalam—avoid stiff or bookish Sanskritized phrasing.
 3. Under `===SUBTITLES_SRT===`:
-   - Output valid `.srt` subtitle blocks (`00:MM:SS,000 --> 00:MM:SS,000`) matching the exact start and end timestamps of those spoken segments (leaving gaps where there is no voiceover) with clean Malayalam lines only.
+   - Output valid `.srt` subtitle blocks (`00:MM:SS,000 --> 00:MM:SS,000`) matching the exact start and end timestamps of those spoken segments (with only short 2–4 second gaps between segments) with clean Malayalam lines only.
 """
 
         raw_text = generate_with_retry(client, uploaded_file, prompt)
