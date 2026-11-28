@@ -160,21 +160,20 @@ def generate_malayalam_script(video_path: Path, style: str, extra_notes: str) ->
 
         extra_section = f"\nAdditional creator notes/context: {extra_notes}" if extra_notes else ""
 
-        prompt = f"""Watch this entire video carefully, noting every scene cut, visual mood, camera movement, pacing, and ambient context.
-Write a natural, engaging Malayalam voiceover script synchronized to the exact timestamps of the video.
+        prompt = f"""Watch this entire video and write a concise, engaging Malayalam voiceover script that highlights all key moments, locations, and transitions without narrating every single second or minor camera cut.
 
 Style requested: {style}{extra_section}
 
 Strict Output Requirements:
 1. Provide TWO clearly separated sections using the exact markers `===SCRIPT_TXT===` and `===SUBTITLES_SRT===`.
 2. Under `===SCRIPT_TXT===`:
-   - Start with a catchy, warm, conversational Malayalam hook suited to the opening shots (e.g., inviting the viewer along on the journey).
-   - Break down the narration with exact `[MM:SS - MM:SS]` timestamps matching each visual segment.
-   - Include a brief Malayalam visual cue `(ദൃശ്യം: ...)` before each narration block.
-   - Use natural, contemporary, spoken-friendly Malayalam—avoid stiff, overly formal, or bookish Sanskritized phrasing.
-   - Leave natural breathing pauses during scenic/ambient transitions so the voiceover never feels rushed.
+   - Group related shots into broader, natural story segments (e.g., 15–45 second chapters/beats) instead of second-by-second commentary.
+   - Start with a crisp, warm, conversational Malayalam hook suited to the opening mood.
+   - Use `[MM:SS - MM:SS]` timestamps for each major segment, preceded by a short one-line Malayalam scene tag `(ദൃശ്യം: ...)`.
+   - Keep each narration block short, punchy, and natural (1–3 crisp sentences per segment)—capture every important highlight, shift in scenery, or key moment without over-describing what is already obvious on screen.
+   - Use natural, contemporary, spoken-friendly Malayalam—avoid stiff or bookish Sanskritized phrasing, and leave generous breathing pauses so the visuals shine.
 3. Under `===SUBTITLES_SRT===`:
-   - Output valid `.srt` subtitle blocks (`00:MM:SS,000 --> 00:MM:SS,000`) containing only the clean Malayalam narration lines ready for video editors.
+   - Output valid `.srt` subtitle blocks (`00:MM:SS,000 --> 00:MM:SS,000`) matching those concise narration blocks with clean Malayalam lines only.
 """
 
         print("Generating Malayalam voiceover script with gemini-2.5-flash...")
