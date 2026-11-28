@@ -26,13 +26,13 @@ def get_drive_service():
             "Missing Google Drive OAuth secrets (GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN)."
         )
 
+    # Omit explicit scopes so Google refreshes using the exact scope(s) granted to the refresh token
     creds = Credentials(
         token=None,
         refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=client_id,
         client_secret=client_secret,
-        scopes=["https://www.googleapis.com/auth/drive"],
     )
     creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
